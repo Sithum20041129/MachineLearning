@@ -156,3 +156,6 @@ predictions.csv
 # Windows specific
 Thumbs.db
 desktop.ini
+
+# Datasets
+my_dataset/

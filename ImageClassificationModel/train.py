@@ -26,7 +26,8 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset, random_split, WeightedRandomSampler
-from torch.cuda.amp import GradScaler, autocast
+from torch.cuda.amp import GradScaler
+from torch.amp import autocast
 
 import timm
 from timm.data import resolve_data_config, create_transform
@@ -54,10 +55,11 @@ class Config:
     """
 
     # ── Dataset details ──────────────────────────────────────────────────────
-    TRAIN_DIR       = r"path/to/train"        # Root of training images (with class sub-folders)
-    TEST_DIR        = r"path/to/test"         # Folder of unlabelled test images
-    NUM_CLASSES     = 10                       # Number of target classes
-    CLASS_IMBALANCE = False                    # Set True if classes are imbalanced
+    TRAIN_CSV       = r"C:\Users\Yasiru Sithum\OneDrive\Documents\webprojects\MachineLearning\my_dataset\train.csv"
+    TEST_CSV        = r"C:\Users\Yasiru Sithum\OneDrive\Documents\webprojects\MachineLearning\my_dataset\test.csv"
+    IMAGES_DIR      = r"C:\Users\Yasiru Sithum\OneDrive\Documents\webprojects\MachineLearning\my_dataset\images\images"
+    NUM_CLASSES     = 4                        # Number of target classes: tom, jerry, both, none
+    CLASS_IMBALANCE = True                     # Enabled
     IMAGE_SIZE      = 224                      # Target H×W (224 for ConvNeXt-Tiny, 300 for EfficientNetV2-S)
 
     # ── Model ────────────────────────────────────────────────────────────────
@@ -69,7 +71,7 @@ class Config:
     PHASE1_EPOCHS   = 3                        # Head-only training epochs
     PHASE2_EPOCHS   = 12                       # Full fine-tuning epochs
     BATCH_SIZE      = 32
-    NUM_WORKERS     = 4                        # DataLoader workers (set 0 on Windows if issues)
+    NUM_WORKERS     = 0                        # DataLoader workers (set 0 on Windows to avoid issues)
     LR_HEAD         = 1e-3                     # Learning rate for Phase 1 (head only)
     LR_FINETUNE     = 1e-4                     # Learning rate for Phase 2 (1/10th — gentler)
     WEIGHT_DECAY    = 1e-2                     # AdamW weight decay (good default)
@@ -116,49 +118,31 @@ seed_everything(cfg.SEED)
 
 class ImageClassificationDataset(Dataset):
     """
-    Expects the standard ImageFolder layout:
-        train_dir/
-            class_a/
-                img001.jpg
-                img002.jpg
-            class_b/
-                ...
-
-    For test data (no labels), pass `is_test=True`.
+    Loads images using a CSV file mapping filenames to labels.
     """
 
     VALID_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff"}
 
-    def __init__(self, root_dir: str, transform=None, is_test: bool = False):
-        self.root_dir  = Path(root_dir)
+    def __init__(self, csv_path: str, images_dir: str, transform=None, is_test: bool = False):
+        self.csv_path = Path(csv_path)
+        self.images_dir = Path(images_dir)
         self.transform = transform
-        self.is_test   = is_test
-        self.samples   = []       # List of (image_path, label_index)
-        self.classes   = []       # Sorted class names
-        self.class_to_idx = {}
+        self.is_test = is_test
 
-        if is_test:
-            # ── Test mode: just glob all images, no labels ────────────────
-            self.samples = [
-                (str(p), -1)
-                for p in sorted(self.root_dir.rglob("*"))
-                if p.suffix.lower() in self.VALID_EXTENSIONS
-            ]
-        else:
-            # ── Train mode: read sub-folder names as class labels ─────────
-            self.classes = sorted([
-                d.name for d in self.root_dir.iterdir() if d.is_dir()
-            ])
-            self.class_to_idx = {c: i for i, c in enumerate(self.classes)}
+        self.df = pd.read_csv(csv_path)
+        self.classes = ["none", "tom", "jerry", "both"]  # 0: none, 1: tom, 2: jerry, 3: both
+        self.class_to_idx = {c: i for i, c in enumerate(self.classes)}
 
-            for cls_name, cls_idx in self.class_to_idx.items():
-                cls_dir = self.root_dir / cls_name
-                for img_path in sorted(cls_dir.rglob("*")):
-                    if img_path.suffix.lower() in self.VALID_EXTENSIONS:
-                        self.samples.append((str(img_path), cls_idx))
+        self.samples = []
+        for _, row in self.df.iterrows():
+            img_path = self.images_dir / row["filename"]
+            if is_test:
+                label = -1
+            else:
+                label = int(row["appearance"])
+            self.samples.append((str(img_path), label))
 
-        print(f"[Dataset] Loaded {len(self.samples)} images "
-              f"from '{root_dir}' ({'test' if is_test else 'train'} mode)")
+        print(f"[Dataset] Loaded {len(self.samples)} images from '{csv_path}' ({'test' if is_test else 'train'} mode)")
 
     def __len__(self):
         return len(self.samples)
@@ -372,9 +356,6 @@ def train_one_epoch(
         optimizer.zero_grad(set_to_none=True)  # Slightly faster than zero_grad()
 
         # ── Mixed-precision forward pass ──────────────────────────────────
-        # Why AMP?
-        #   • ~1.5–2× speedup on Ampere+ GPUs with negligible accuracy loss.
-        #   • float16 forward → float32 loss scaling → float16 backward.
         with autocast(device_type="cuda", enabled=(device.type == "cuda")):
             logits = model(images)
             loss   = criterion(logits, labels)
@@ -445,7 +426,7 @@ def run_training(cfg: Config):
     os.makedirs(cfg.SAVE_DIR, exist_ok=True)
 
     # ── 8a. Build dataset & 80/20 split ───────────────────────────────────
-    full_dataset = ImageClassificationDataset(cfg.TRAIN_DIR)
+    full_dataset = ImageClassificationDataset(cfg.TRAIN_CSV, cfg.IMAGES_DIR)
     num_val   = int(len(full_dataset) * cfg.VAL_SPLIT)
     num_train = len(full_dataset) - num_val
 
@@ -457,10 +438,7 @@ def run_training(cfg: Config):
     print(f"[Split] Train: {num_train} | Val: {num_val}")
 
     # ── 8b. Wrap subsets with appropriate transforms ──────────────────────
-    # Note: `random_split` returns Subsets that share the parent dataset's
-    # transform.  We wrap them in a thin dataset that overrides the transform.
     class TransformSubset(Dataset):
-        """Wraps a Subset with a custom transform (avoids mutating the parent)."""
         def __init__(self, subset, transform):
             self.subset    = subset
             self.transform = transform
@@ -483,11 +461,11 @@ def run_training(cfg: Config):
         shuffle=True,
         num_workers=cfg.NUM_WORKERS,
         pin_memory=True,
-        drop_last=True,             # Avoids tiny last batch (can destabilise BN)
+        drop_last=True,
     )
     val_loader = DataLoader(
         val_ds,
-        batch_size=cfg.BATCH_SIZE * 2,  # Larger batch OK for eval (no grads)
+        batch_size=cfg.BATCH_SIZE * 2,
         shuffle=False,
         num_workers=cfg.NUM_WORKERS,
         pin_memory=True,
@@ -498,8 +476,6 @@ def run_training(cfg: Config):
     model.to(cfg.DEVICE)
 
     # ── 8e. Loss function ─────────────────────────────────────────────────
-    # Label smoothing = 0.1: prevents the model from becoming overconfident.
-    # Class weights: compensate for imbalanced class frequencies.
     if cfg.CLASS_IMBALANCE:
         weights = compute_class_weights(full_dataset, cfg.NUM_CLASSES).to(cfg.DEVICE)
         criterion = nn.CrossEntropyLoss(
@@ -524,7 +500,6 @@ def run_training(cfg: Config):
 
     freeze_backbone(model)
 
-    # Only optimise parameters that require gradients
     optimizer_p1 = optim.AdamW(
         filter(lambda p: p.requires_grad, model.parameters()),
         lr=cfg.LR_HEAD,
@@ -543,15 +518,14 @@ def run_training(cfg: Config):
         history["val_loss"].append(val_loss)
         history["val_acc"].append(val_acc)
 
-        print(f"  Epoch {epoch}/{cfg.PHASE1_EPOCHS}  │  "
-              f"Train Loss: {train_loss:.4f}  Acc: {train_acc:.4f}  │  "
+        print(f"  Epoch {epoch}/{cfg.PHASE1_EPOCHS}  |  "
+              f"Train Loss: {train_loss:.4f}  Acc: {train_acc:.4f}  |  "
               f"Val Loss: {val_loss:.4f}  Acc: {val_acc:.4f}")
 
-        # Save best model
         if val_acc > best_val_acc:
             best_val_acc = val_acc
             torch.save(model.state_dict(), cfg.BEST_MODEL_PATH)
-            print(f"  ✓ New best model saved (val_acc={val_acc:.4f})")
+            print(f"  [OK] New best model saved (val_acc={val_acc:.4f})")
 
     # ══════════════════════════════════════════════════════════════════════
     #   PHASE 2 — Fine-tune ENTIRE network (backbone unfrozen)
@@ -562,17 +536,12 @@ def run_training(cfg: Config):
 
     unfreeze_all(model)
 
-    # Why a lower LR?
-    #   The backbone features are already excellent from ImageNet. A large LR
-    #   would corrupt them ("catastrophic forgetting").  1/10th is standard.
     optimizer_p2 = optim.AdamW(
         model.parameters(),
         lr=cfg.LR_FINETUNE,
         weight_decay=cfg.WEIGHT_DECAY,
     )
 
-    # Cosine-annealing scheduler: smoothly decays LR to near-zero,
-    # which often yields better final accuracy than a flat LR.
     scheduler_p2 = optim.lr_scheduler.CosineAnnealingLR(
         optimizer_p2,
         T_max=cfg.PHASE2_EPOCHS,
@@ -593,20 +562,20 @@ def run_training(cfg: Config):
         history["val_loss"].append(val_loss)
         history["val_acc"].append(val_acc)
 
-        print(f"  Epoch {epoch}/{cfg.PHASE2_EPOCHS}  │  "
-              f"Train Loss: {train_loss:.4f}  Acc: {train_acc:.4f}  │  "
-              f"Val Loss: {val_loss:.4f}  Acc: {val_acc:.4f}  │  "
+        print(f"  Epoch {epoch}/{cfg.PHASE2_EPOCHS}  |  "
+              f"Train Loss: {train_loss:.4f}  Acc: {train_acc:.4f}  |  "
+              f"Val Loss: {val_loss:.4f}  Acc: {val_acc:.4f}  |  "
               f"LR: {current_lr:.2e}")
 
         if val_acc > best_val_acc:
             best_val_acc = val_acc
             torch.save(model.state_dict(), cfg.BEST_MODEL_PATH)
-            print(f"  ✓ New best model saved (val_acc={val_acc:.4f})")
+            print(f"  [OK] New best model saved (val_acc={val_acc:.4f})")
 
-    print(f"\n{'─' * 70}")
+    print(f"\n{'-' * 70}")
     print(f"  Training complete.  Best validation accuracy: {best_val_acc:.4f}")
     print(f"  Best model saved to: {cfg.BEST_MODEL_PATH}")
-    print(f"{'─' * 70}\n")
+    print(f"{'-' * 70}\n")
 
     return model, history
 
@@ -619,76 +588,67 @@ def run_training(cfg: Config):
 def predict_with_tta(cfg: Config) -> pd.DataFrame:
     """
     Load the best saved model and predict on every image in `cfg.TEST_DIR`.
-
-    Test-Time Augmentation (TTA):
-      1. Predict on the original (clean) image.
-      2. Predict on a horizontally-flipped version.
-      3. Average the softmax probabilities.
-      4. Take the argmax as the final prediction.
-
-    Why TTA?
-      • Essentially free accuracy boost (~0.3–1.0 %) at the cost of 2× inference
-        time.  Very common in Kaggle competitions.
-
-    Returns:
-        pd.DataFrame with columns ['image_path', 'predicted_class', 'confidence']
     """
     print("\n" + "=" * 70)
     print("  INFERENCE (with TTA)")
     print("=" * 70)
 
-    # ── Load best model ───────────────────────────────────────────────────
     model = build_model(cfg.MODEL_NAME, cfg.NUM_CLASSES, pretrained=False)
     model.load_state_dict(torch.load(cfg.BEST_MODEL_PATH, map_location=cfg.DEVICE))
     model.to(cfg.DEVICE)
     model.eval()
     print(f"[Inference] Loaded weights from '{cfg.BEST_MODEL_PATH}'")
 
-    # ── TTA transform list ────────────────────────────────────────────────
     tta_transforms = get_tta_transforms(cfg.IMAGE_SIZE)
 
-    # ── Collect test images ───────────────────────────────────────────────
     test_dataset = ImageClassificationDataset(
-        cfg.TEST_DIR,
-        transform=None,      # We apply transforms manually per TTA variant
+        cfg.TEST_CSV,
+        cfg.IMAGES_DIR,
+        transform=None,
         is_test=True,
     )
 
     results = []
 
     for raw_image_tensor, img_path in tqdm(test_dataset, desc="  [TTA Inference]"):
-        # raw_image_tensor is actually a PIL Image here (transform=None)
-        # Re-open to be safe:
         pil_image = Image.open(img_path).convert("RGB")
-
-        # Accumulate softmax probabilities across TTA variants
         avg_probs = torch.zeros(cfg.NUM_CLASSES, device=cfg.DEVICE)
 
         for tta_tfm in tta_transforms:
-            tensor = tta_tfm(pil_image).unsqueeze(0).to(cfg.DEVICE)  # [1, C, H, W]
+            tensor = tta_tfm(pil_image).unsqueeze(0).to(cfg.DEVICE)
 
             with autocast(device_type="cuda", enabled=(cfg.DEVICE.type == "cuda")):
                 logits = model(tensor)
 
-            probs = torch.softmax(logits, dim=1).squeeze(0)          # [num_classes]
+            probs = torch.softmax(logits, dim=1).squeeze(0)
             avg_probs += probs
 
-        avg_probs /= len(tta_transforms)    # Average over TTA variants
+        avg_probs /= len(tta_transforms)
 
         pred_class  = avg_probs.argmax().item()
         confidence  = avg_probs[pred_class].item()
 
+        filename = Path(img_path).name
         results.append({
-            "image_path":      img_path,
-            "predicted_class": pred_class,
+            "filename":        filename,
+            "appearance":      pred_class,
             "confidence":      round(confidence, 4),
         })
 
     df = pd.DataFrame(results)
-    submission_path = os.path.join(cfg.SAVE_DIR, "predictions.csv")
-    df.to_csv(submission_path, index=False)
-    print(f"[Inference] Saved {len(df)} predictions to '{submission_path}'")
-    print(df.head(10).to_string(index=False))
+    
+    # Save submission-ready file (matching sample_submission.csv format)
+    submission_df = df[["filename", "appearance"]]
+    submission_path = os.path.join(cfg.SAVE_DIR, "submission.csv")
+    submission_df.to_csv(submission_path, index=False)
+    print(f"[Inference] Saved submission format to '{submission_path}'")
+    
+    # Save full prediction details with confidence scores
+    predictions_path = os.path.join(cfg.SAVE_DIR, "predictions.csv")
+    df.to_csv(predictions_path, index=False)
+    print(f"[Inference] Saved full predictions with confidence to '{predictions_path}'")
+    
+    print(submission_df.head(10).to_string(index=False))
 
     return df
 
@@ -702,10 +662,8 @@ def evaluate_val_set(cfg: Config):
     """
     Run the best model on the validation set and print a full
     classification report + confusion matrix.
-    Useful for debugging before submitting.
     """
-    # Rebuild dataset & split with same seed → identical val set
-    full_dataset = ImageClassificationDataset(cfg.TRAIN_DIR)
+    full_dataset = ImageClassificationDataset(cfg.TRAIN_CSV, cfg.IMAGES_DIR)
     num_val   = int(len(full_dataset) * cfg.VAL_SPLIT)
     num_train = len(full_dataset) - num_val
 
@@ -731,7 +689,6 @@ def evaluate_val_set(cfg: Config):
     val_loader = DataLoader(val_ds, batch_size=cfg.BATCH_SIZE * 2,
                             shuffle=False, num_workers=cfg.NUM_WORKERS)
 
-    # Load best model
     model = build_model(cfg.MODEL_NAME, cfg.NUM_CLASSES, pretrained=False)
     model.load_state_dict(torch.load(cfg.BEST_MODEL_PATH, map_location=cfg.DEVICE))
     model.to(cfg.DEVICE)
@@ -746,9 +703,9 @@ def evaluate_val_set(cfg: Config):
         all_labels.extend(labels.tolist())
 
     class_names = full_dataset.classes
-    print("\n── Classification Report ──")
+    print("\n-- Classification Report --")
     print(classification_report(all_labels, all_preds, target_names=class_names))
-    print("── Confusion Matrix ──")
+    print("-- Confusion Matrix --")
     print(confusion_matrix(all_labels, all_preds))
 
 
@@ -770,7 +727,6 @@ if __name__ == "__main__":
     evaluate_val_set(cfg)
 
     # ── Step 3: Inference on test set with TTA ────────────────────────────
-    # Uncomment the line below when you have a test folder ready:
-    # predict_with_tta(cfg)
+    predict_with_tta(cfg)
 
-    print("\n✓ Pipeline complete.")
+    print("\n-- Pipeline complete --")
