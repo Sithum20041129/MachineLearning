@@ -41,6 +41,7 @@ from torchvision.transforms import (
 from PIL import Image
 from tqdm import tqdm
 from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.model_selection import StratifiedKFold
 
 warnings.filterwarnings("ignore")
 
@@ -83,7 +84,8 @@ class Config:
 
     # ── Paths ────────────────────────────────────────────────────────────────
     SAVE_DIR        = "checkpoints"
-    BEST_MODEL_PATH = os.path.join(SAVE_DIR, "best_model.pth")
+    BEST_MODEL_PATH = os.path.join(SAVE_DIR, "best_model_fold_{fold}.pth")
+    NUM_FOLDS       = 5
 
     # ── Reproducibility ──────────────────────────────────────────────────────
     SEED            = 42
@@ -419,165 +421,180 @@ def validate(
 
 def run_training(cfg: Config):
     """
-    Orchestrates the full two-phase training pipeline:
-      Phase 1 — Head-only   (high LR, frozen backbone)
-      Phase 2 — Full model  (low LR, everything unfrozen)
+    Orchestrates the Stratified K-Fold training pipeline.
     """
     os.makedirs(cfg.SAVE_DIR, exist_ok=True)
 
-    # ── 8a. Build dataset & 80/20 split ───────────────────────────────────
+    # ── 8a. Build dataset ─────────────────────────────────────────────────
     full_dataset = ImageClassificationDataset(cfg.TRAIN_CSV, cfg.IMAGES_DIR)
-    num_val   = int(len(full_dataset) * cfg.VAL_SPLIT)
-    num_train = len(full_dataset) - num_val
-
-    train_subset, val_subset = random_split(
-        full_dataset,
-        [num_train, num_val],
-        generator=torch.Generator().manual_seed(cfg.SEED),
-    )
-    print(f"[Split] Train: {num_train} | Val: {num_val}")
-
-    # ── 8b. Wrap subsets with appropriate transforms ──────────────────────
-    class TransformSubset(Dataset):
-        def __init__(self, subset, transform):
-            self.subset    = subset
+    
+    # Extract labels for stratified K-fold split
+    labels = [sample[1] for sample in full_dataset.samples]
+    
+    # Initialize StratifiedKFold
+    skf = StratifiedKFold(n_splits=cfg.NUM_FOLDS, shuffle=True, random_state=cfg.SEED)
+    
+    # Helper to wrap subset index lists with appropriate transforms
+    class TransformIndicesDataset(Dataset):
+        def __init__(self, parent_dataset, indices, transform):
+            self.parent_dataset = parent_dataset
+            self.indices = indices
             self.transform = transform
         def __len__(self):
-            return len(self.subset)
+            return len(self.indices)
         def __getitem__(self, idx):
-            img_path, label = self.subset.dataset.samples[self.subset.indices[idx]]
+            img_path, label = self.parent_dataset.samples[self.indices[idx]]
             image = Image.open(img_path).convert("RGB")
             if self.transform:
                 image = self.transform(image)
             return image, label
 
-    train_ds = TransformSubset(train_subset, get_train_transforms(cfg.IMAGE_SIZE, cfg.AUG_STRATEGY))
-    val_ds   = TransformSubset(val_subset,   get_val_transforms(cfg.IMAGE_SIZE))
+    oof_preds = np.zeros((len(full_dataset), cfg.NUM_CLASSES))
+    fold_accuracies = []
 
-    # ── 8c. DataLoaders ───────────────────────────────────────────────────
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=cfg.BATCH_SIZE,
-        shuffle=True,
-        num_workers=cfg.NUM_WORKERS,
-        pin_memory=True,
-        drop_last=True,
-    )
-    val_loader = DataLoader(
-        val_ds,
-        batch_size=cfg.BATCH_SIZE * 2,
-        shuffle=False,
-        num_workers=cfg.NUM_WORKERS,
-        pin_memory=True,
-    )
-
-    # ── 8d. Model ─────────────────────────────────────────────────────────
-    model = build_model(cfg.MODEL_NAME, cfg.NUM_CLASSES, cfg.PRETRAINED)
-    model.to(cfg.DEVICE)
-
-    # ── 8e. Loss function ─────────────────────────────────────────────────
-    if cfg.CLASS_IMBALANCE:
-        weights = compute_class_weights(full_dataset, cfg.NUM_CLASSES).to(cfg.DEVICE)
-        criterion = nn.CrossEntropyLoss(
-            weight=weights,
-            label_smoothing=cfg.LABEL_SMOOTHING,
+    for fold_idx, (train_idx, val_idx) in enumerate(skf.split(np.zeros(len(labels)), labels)):
+        print("\n" + "=" * 70)
+        print(f"  FOLD {fold_idx + 1} / {cfg.NUM_FOLDS}")
+        print("=" * 70)
+        
+        train_ds = TransformIndicesDataset(full_dataset, train_idx, get_train_transforms(cfg.IMAGE_SIZE, cfg.AUG_STRATEGY))
+        val_ds   = TransformIndicesDataset(full_dataset, val_idx,   get_val_transforms(cfg.IMAGE_SIZE))
+        
+        train_loader = DataLoader(
+            train_ds,
+            batch_size=cfg.BATCH_SIZE,
+            shuffle=True,
+            num_workers=cfg.NUM_WORKERS,
+            pin_memory=True,
+            drop_last=True,
         )
-    else:
-        criterion = nn.CrossEntropyLoss(label_smoothing=cfg.LABEL_SMOOTHING)
-
-    # ── 8f. Mixed-precision scaler ────────────────────────────────────────
-    scaler = GradScaler(enabled=(cfg.DEVICE.type == "cuda"))
-
-    best_val_acc  = 0.0
-    history = {"train_loss": [], "train_acc": [], "val_loss": [], "val_acc": []}
-
-    # ══════════════════════════════════════════════════════════════════════
-    #   PHASE 1 — Train HEAD only (backbone frozen)
-    # ══════════════════════════════════════════════════════════════════════
-    print("\n" + "=" * 70)
-    print("  PHASE 1: Head-only training (backbone frozen)")
-    print("=" * 70)
-
-    freeze_backbone(model)
-
-    optimizer_p1 = optim.AdamW(
-        filter(lambda p: p.requires_grad, model.parameters()),
-        lr=cfg.LR_HEAD,
-        weight_decay=cfg.WEIGHT_DECAY,
-    )
-
-    for epoch in range(1, cfg.PHASE1_EPOCHS + 1):
-        train_loss, train_acc = train_one_epoch(
-            model, train_loader, criterion, optimizer_p1,
-            scaler, cfg.DEVICE, epoch, phase_name="P1-Head",
+        val_loader = DataLoader(
+            val_ds,
+            batch_size=cfg.BATCH_SIZE * 2,
+            shuffle=False,
+            num_workers=cfg.NUM_WORKERS,
+            pin_memory=True,
         )
-        val_loss, val_acc = validate(model, val_loader, criterion, cfg.DEVICE)
-
-        history["train_loss"].append(train_loss)
-        history["train_acc"].append(train_acc)
-        history["val_loss"].append(val_loss)
-        history["val_acc"].append(val_acc)
-
-        print(f"  Epoch {epoch}/{cfg.PHASE1_EPOCHS}  |  "
-              f"Train Loss: {train_loss:.4f}  Acc: {train_acc:.4f}  |  "
-              f"Val Loss: {val_loss:.4f}  Acc: {val_acc:.4f}")
-
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
-            torch.save(model.state_dict(), cfg.BEST_MODEL_PATH)
-            print(f"  [OK] New best model saved (val_acc={val_acc:.4f})")
-
-    # ══════════════════════════════════════════════════════════════════════
-    #   PHASE 2 — Fine-tune ENTIRE network (backbone unfrozen)
-    # ══════════════════════════════════════════════════════════════════════
-    print("\n" + "=" * 70)
-    print("  PHASE 2: Full fine-tuning (all layers unfrozen)")
-    print("=" * 70)
-
-    unfreeze_all(model)
-
-    optimizer_p2 = optim.AdamW(
-        model.parameters(),
-        lr=cfg.LR_FINETUNE,
-        weight_decay=cfg.WEIGHT_DECAY,
-    )
-
-    scheduler_p2 = optim.lr_scheduler.CosineAnnealingLR(
-        optimizer_p2,
-        T_max=cfg.PHASE2_EPOCHS,
-        eta_min=1e-7,
-    )
-
-    for epoch in range(1, cfg.PHASE2_EPOCHS + 1):
-        train_loss, train_acc = train_one_epoch(
-            model, train_loader, criterion, optimizer_p2,
-            scaler, cfg.DEVICE, epoch, phase_name="P2-Full",
+        
+        # Build fresh model
+        model = build_model(cfg.MODEL_NAME, cfg.NUM_CLASSES, cfg.PRETRAINED)
+        model.to(cfg.DEVICE)
+        
+        # Loss function
+        if cfg.CLASS_IMBALANCE:
+            # Recompute weights specific to the training fold
+            fold_labels = [labels[i] for i in train_idx]
+            counts = Counter(fold_labels)
+            total = len(fold_labels)
+            weights = torch.zeros(cfg.NUM_CLASSES, dtype=torch.float32)
+            for cls_idx in range(cfg.NUM_CLASSES):
+                n_c = counts.get(cls_idx, 1)
+                weights[cls_idx] = total / (cfg.NUM_CLASSES * n_c)
+            weights = weights.to(cfg.DEVICE)
+            print(f"[Weights] Fold class weights: {weights.tolist()}")
+            criterion = nn.CrossEntropyLoss(
+                weight=weights,
+                label_smoothing=cfg.LABEL_SMOOTHING,
+            )
+        else:
+            criterion = nn.CrossEntropyLoss(label_smoothing=cfg.LABEL_SMOOTHING)
+            
+        scaler = GradScaler(enabled=(cfg.DEVICE.type == "cuda"))
+        best_val_acc = 0.0
+        fold_best_path = cfg.BEST_MODEL_PATH.format(fold=fold_idx)
+        
+        # Phase 1: Train head only
+        print(f"\n  [Fold {fold_idx + 1}] Phase 1: Head-only training")
+        freeze_backbone(model)
+        optimizer_p1 = optim.AdamW(
+            filter(lambda p: p.requires_grad, model.parameters()),
+            lr=cfg.LR_HEAD,
+            weight_decay=cfg.WEIGHT_DECAY,
         )
-        val_loss, val_acc = validate(model, val_loader, criterion, cfg.DEVICE)
-        scheduler_p2.step()
-
-        current_lr = scheduler_p2.get_last_lr()[0]
-        history["train_loss"].append(train_loss)
-        history["train_acc"].append(train_acc)
-        history["val_loss"].append(val_loss)
-        history["val_acc"].append(val_acc)
-
-        print(f"  Epoch {epoch}/{cfg.PHASE2_EPOCHS}  |  "
-              f"Train Loss: {train_loss:.4f}  Acc: {train_acc:.4f}  |  "
-              f"Val Loss: {val_loss:.4f}  Acc: {val_acc:.4f}  |  "
-              f"LR: {current_lr:.2e}")
-
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
-            torch.save(model.state_dict(), cfg.BEST_MODEL_PATH)
-            print(f"  [OK] New best model saved (val_acc={val_acc:.4f})")
+        
+        for epoch in range(1, cfg.PHASE1_EPOCHS + 1):
+            train_loss, train_acc = train_one_epoch(
+                model, train_loader, criterion, optimizer_p1,
+                scaler, cfg.DEVICE, epoch, phase_name=f"F{fold_idx+1}-P1"
+            )
+            val_loss, val_acc = validate(model, val_loader, criterion, cfg.DEVICE)
+            print(f"  Epoch {epoch}/{cfg.PHASE1_EPOCHS}  |  "
+                  f"Train Loss: {train_loss:.4f}  Acc: {train_acc:.4f}  |  "
+                  f"Val Loss: {val_loss:.4f}  Acc: {val_acc:.4f}")
+            if val_acc > best_val_acc:
+                best_val_acc = val_acc
+                torch.save(model.state_dict(), fold_best_path)
+                print(f"  [OK] New best model saved (val_acc={val_acc:.4f})")
+                
+        # Phase 2: Full fine-tuning
+        print(f"\n  [Fold {fold_idx + 1}] Phase 2: Full fine-tuning")
+        unfreeze_all(model)
+        optimizer_p2 = optim.AdamW(
+            model.parameters(),
+            lr=cfg.LR_FINETUNE,
+            weight_decay=cfg.WEIGHT_DECAY,
+        )
+        scheduler_p2 = optim.lr_scheduler.CosineAnnealingLR(
+            optimizer_p2,
+            T_max=cfg.PHASE2_EPOCHS,
+            eta_min=1e-7,
+        )
+        
+        for epoch in range(1, cfg.PHASE2_EPOCHS + 1):
+            train_loss, train_acc = train_one_epoch(
+                model, train_loader, criterion, optimizer_p2,
+                scaler, cfg.DEVICE, epoch, phase_name=f"F{fold_idx+1}-P2"
+            )
+            val_loss, val_acc = validate(model, val_loader, criterion, cfg.DEVICE)
+            scheduler_p2.step()
+            
+            current_lr = scheduler_p2.get_last_lr()[0]
+            print(f"  Epoch {epoch}/{cfg.PHASE2_EPOCHS}  |  "
+                  f"Train Loss: {train_loss:.4f}  Acc: {train_acc:.4f}  |  "
+                  f"Val Loss: {val_loss:.4f}  Acc: {val_acc:.4f}  |  "
+                  f"LR: {current_lr:.2e}")
+            if val_acc > best_val_acc:
+                best_val_acc = val_acc
+                torch.save(model.state_dict(), fold_best_path)
+                print(f"  [OK] New best model saved (val_acc={val_acc:.4f})")
+                
+        print(f"\n  Fold {fold_idx + 1} training complete. Best Val Acc: {best_val_acc:.4f}")
+        fold_accuracies.append(best_val_acc)
+        
+        # Load the best weights of this fold to generate OOF predictions
+        model.load_state_dict(torch.load(fold_best_path, map_location=cfg.DEVICE))
+        model.eval()
+        
+        val_loader_no_shuffle = DataLoader(
+            val_ds,
+            batch_size=cfg.BATCH_SIZE * 2,
+            shuffle=False,
+            num_workers=cfg.NUM_WORKERS,
+            pin_memory=True,
+        )
+        
+        start_idx = 0
+        with torch.no_grad():
+            for images, _ in val_loader_no_shuffle:
+                images = images.to(cfg.DEVICE)
+                with autocast(device_type="cuda", enabled=(cfg.DEVICE.type == "cuda")):
+                    logits = model(images)
+                probs = torch.softmax(logits, dim=1).cpu().numpy()
+                batch_size = images.size(0)
+                fold_val_indices = val_idx[start_idx : start_idx + batch_size]
+                oof_preds[fold_val_indices] = probs
+                start_idx += batch_size
 
     print(f"\n{'-' * 70}")
-    print(f"  Training complete.  Best validation accuracy: {best_val_acc:.4f}")
-    print(f"  Best model saved to: {cfg.BEST_MODEL_PATH}")
+    print(f"  All folds training complete. Mean Fold Acc: {np.mean(fold_accuracies):.4f}")
+    oof_accuracy = (oof_preds.argmax(axis=1) == np.array(labels)).mean()
+    print(f"  Out-of-Fold (OOF) Accuracy: {oof_accuracy:.4f}")
     print(f"{'-' * 70}\n")
-
-    return model, history
+    
+    # Save the OOF predictions for validation report
+    np.save(os.path.join(cfg.SAVE_DIR, "oof_preds.npy"), oof_preds)
+    
+    return oof_preds
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -587,53 +604,75 @@ def run_training(cfg: Config):
 @torch.no_grad()
 def predict_with_tta(cfg: Config) -> pd.DataFrame:
     """
-    Load the best saved model and predict on every image in `cfg.TEST_DIR`.
+    Load all K-fold models and ensemble predict on every image in the test set in batches.
     """
     print("\n" + "=" * 70)
-    print("  INFERENCE (with TTA)")
+    print("  ENSEMBLE INFERENCE (with TTA - Batched)")
     print("=" * 70)
 
-    model = build_model(cfg.MODEL_NAME, cfg.NUM_CLASSES, pretrained=False)
-    model.load_state_dict(torch.load(cfg.BEST_MODEL_PATH, map_location=cfg.DEVICE))
-    model.to(cfg.DEVICE)
-    model.eval()
-    print(f"[Inference] Loaded weights from '{cfg.BEST_MODEL_PATH}'")
+    # Build and load all K-fold models
+    models = []
+    for fold_idx in range(cfg.NUM_FOLDS):
+        model = build_model(cfg.MODEL_NAME, cfg.NUM_CLASSES, pretrained=False)
+        fold_best_path = cfg.BEST_MODEL_PATH.format(fold=fold_idx)
+        model.load_state_dict(torch.load(fold_best_path, map_location=cfg.DEVICE))
+        model.to(cfg.DEVICE)
+        model.eval()
+        models.append(model)
+        print(f"[Inference] Loaded Fold {fold_idx + 1} weights from '{fold_best_path}'")
 
-    tta_transforms = get_tta_transforms(cfg.IMAGE_SIZE)
-
+    # Load test dataset with validation-style transforms (normalization and resize)
     test_dataset = ImageClassificationDataset(
         cfg.TEST_CSV,
         cfg.IMAGES_DIR,
-        transform=None,
+        transform=get_val_transforms(cfg.IMAGE_SIZE),
         is_test=True,
+    )
+
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=64,
+        shuffle=False,
+        num_workers=cfg.NUM_WORKERS,
+        pin_memory=True,
     )
 
     results = []
 
-    for raw_image_tensor, img_path in tqdm(test_dataset, desc="  [TTA Inference]"):
-        pil_image = Image.open(img_path).convert("RGB")
-        avg_probs = torch.zeros(cfg.NUM_CLASSES, device=cfg.DEVICE)
+    for images, img_paths in tqdm(test_loader, desc="  [Ensemble Inference]"):
+        images = images.to(cfg.DEVICE)
+        # TTA: Horizontal flip of the batch tensors on GPU
+        flipped_images = torch.flip(images, dims=[3])
 
-        for tta_tfm in tta_transforms:
-            tensor = tta_tfm(pil_image).unsqueeze(0).to(cfg.DEVICE)
+        # Initialize accumulated predictions
+        batch_probs = torch.zeros((images.size(0), cfg.NUM_CLASSES), device=cfg.DEVICE)
 
+        for model in models:
             with autocast(device_type="cuda", enabled=(cfg.DEVICE.type == "cuda")):
-                logits = model(tensor)
+                # Predictions on original batch
+                logits_normal = model(images)
+                probs_normal = torch.softmax(logits_normal, dim=1)
 
-            probs = torch.softmax(logits, dim=1).squeeze(0)
-            avg_probs += probs
+                # Predictions on flipped batch
+                logits_flipped = model(flipped_images)
+                probs_flipped = torch.softmax(logits_flipped, dim=1)
 
-        avg_probs /= len(tta_transforms)
+            batch_probs += (probs_normal + probs_flipped)
 
-        pred_class  = avg_probs.argmax().item()
-        confidence  = avg_probs[pred_class].item()
+        # Average across folds and TTA passes (2 passes)
+        batch_probs /= (cfg.NUM_FOLDS * 2)
+        batch_probs = batch_probs.cpu().numpy()
 
-        filename = Path(img_path).name
-        results.append({
-            "filename":        filename,
-            "appearance":      pred_class,
-            "confidence":      round(confidence, 4),
-        })
+        for idx, img_path in enumerate(img_paths):
+            pred_probs = batch_probs[idx]
+            pred_class = pred_probs.argmax().item()
+            confidence = pred_probs[pred_class].item()
+            filename = Path(img_path).name
+            results.append({
+                "filename":        filename,
+                "appearance":      pred_class,
+                "confidence":      round(confidence, 4),
+            })
 
     df = pd.DataFrame(results)
     
@@ -660,53 +699,19 @@ def predict_with_tta(cfg: Config) -> pd.DataFrame:
 @torch.no_grad()
 def evaluate_val_set(cfg: Config):
     """
-    Run the best model on the validation set and print a full
-    classification report + confusion matrix.
+    Load the OOF predictions and print the consolidated classification report + confusion matrix.
     """
+    oof_preds = np.load(os.path.join(cfg.SAVE_DIR, "oof_preds.npy"))
     full_dataset = ImageClassificationDataset(cfg.TRAIN_CSV, cfg.IMAGES_DIR)
-    num_val   = int(len(full_dataset) * cfg.VAL_SPLIT)
-    num_train = len(full_dataset) - num_val
-
-    _, val_subset = random_split(
-        full_dataset,
-        [num_train, num_val],
-        generator=torch.Generator().manual_seed(cfg.SEED),
-    )
-
-    class TransformSubset(Dataset):
-        def __init__(self, subset, transform):
-            self.subset, self.transform = subset, transform
-        def __len__(self):
-            return len(self.subset)
-        def __getitem__(self, idx):
-            img_path, label = self.subset.dataset.samples[self.subset.indices[idx]]
-            image = Image.open(img_path).convert("RGB")
-            if self.transform:
-                image = self.transform(image)
-            return image, label
-
-    val_ds = TransformSubset(val_subset, get_val_transforms(cfg.IMAGE_SIZE))
-    val_loader = DataLoader(val_ds, batch_size=cfg.BATCH_SIZE * 2,
-                            shuffle=False, num_workers=cfg.NUM_WORKERS)
-
-    model = build_model(cfg.MODEL_NAME, cfg.NUM_CLASSES, pretrained=False)
-    model.load_state_dict(torch.load(cfg.BEST_MODEL_PATH, map_location=cfg.DEVICE))
-    model.to(cfg.DEVICE)
-    model.eval()
-
-    all_preds, all_labels = [], []
-    for images, labels in tqdm(val_loader, desc="  [Eval]"):
-        images = images.to(cfg.DEVICE)
-        with autocast(device_type="cuda", enabled=(cfg.DEVICE.type == "cuda")):
-            logits = model(images)
-        all_preds.extend(logits.argmax(dim=1).cpu().tolist())
-        all_labels.extend(labels.tolist())
-
+    labels = [sample[1] for sample in full_dataset.samples]
+    
+    oof_labels = oof_preds.argmax(axis=1)
     class_names = full_dataset.classes
-    print("\n-- Classification Report --")
-    print(classification_report(all_labels, all_preds, target_names=class_names))
-    print("-- Confusion Matrix --")
-    print(confusion_matrix(all_labels, all_preds))
+    
+    print("\n-- Out-of-Fold (OOF) Classification Report --")
+    print(classification_report(labels, oof_labels, target_names=class_names))
+    print("-- Out-of-Fold (OOF) Confusion Matrix --")
+    print(confusion_matrix(labels, oof_labels))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -721,7 +726,7 @@ if __name__ == "__main__":
     print()
 
     # ── Step 1: Train ─────────────────────────────────────────────────────
-    model, history = run_training(cfg)
+    oof_preds = run_training(cfg)
 
     # ── Step 2: Evaluate on validation set ────────────────────────────────
     evaluate_val_set(cfg)
