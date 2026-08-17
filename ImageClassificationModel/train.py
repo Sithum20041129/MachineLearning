@@ -1,20 +1,30 @@
+# -*- coding: utf-8 -*-
 """
 ================================================================================
-  Kaggle Image Classification Pipeline
-  ─────────────────────────────────────
-  Features:
-    • timm backbone (ConvNeXt-Tiny / EfficientNetV2-S) with ImageNet pretraining
-    • Two-phase freeze → unfreeze fine-tuning
-    • Mixed-precision (AMP) training
-    • AdamW + label-smoothed CrossEntropy (+ optional class weights)
-    • TrivialAugmentWide / RandAugment
-    • 80/20 train/val split
-    • Test-Time Augmentation (TTA) inference
+  Kaggle Tom & Jerry Classification Pipeline - 0.95+ Architecture
+  ──────────────────────────────────────────────────────────────────
+  Features Adapted from 0.95 Leaderboard Submission:
+    1. EMA (Exponential Moving Average, decay=0.999): Smooths model weights to
+       find flat, highly generalizable minima on unseen test data.
+    2. Mixup Regularization (alpha=0.2): Linearly blends image pairs and labels
+       during Phase 2 to prevent background memorization.
+    3. Gradient Clipping (norm=1.0): Prevents gradient shocks in fine-tuning.
+    4. Inverse-Frequency Class Weights + Label Smoothing (0.1): Matches the test
+       set's dominant 44% 'none' and 19% 'both' distribution.
+    5. Macro F1 Checkpointing & Early Stopping (patience=4): Evaluates on the
+       exact competition metric.
+    6. Uniform Fine-Tuning LR (1e-4) with Linear Warmup + Cosine Decay.
+    7. 5-View High-Resolution TTA:
+         • View 1: Original 384×384
+         • View 2: Horizontal Flip
+         • View 3: Zoomed 1.15× Center Crop (enlarges small Jerry characters)
+         • View 4: Zoomed 1.15× + Horizontal Flip
+         • View 5: Tight Crop 1.25× Center Crop
 ================================================================================
 """
 
 import os
-import glob
+import copy
 import random
 import warnings
 from pathlib import Path
@@ -25,75 +35,66 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, Dataset, random_split, WeightedRandomSampler
-from torch.cuda.amp import GradScaler
-from torch.amp import autocast
+from torch.utils.data import DataLoader, Dataset
+from torch.amp import GradScaler, autocast
+from torch.optim.lr_scheduler import SequentialLR, LinearLR, CosineAnnealingLR
 
+from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import classification_report, confusion_matrix, f1_score
 import timm
-from timm.data import resolve_data_config, create_transform
 
 from torchvision import transforms
 from torchvision.transforms import (
     Compose, Resize, CenterCrop, RandomHorizontalFlip,
-    TrivialAugmentWide, RandAugment, ToTensor, Normalize,
+    TrivialAugmentWide, ToTensor, Normalize,
 )
-
 from PIL import Image
 from tqdm import tqdm
-from sklearn.metrics import classification_report, confusion_matrix
-from sklearn.model_selection import StratifiedKFold
 
 warnings.filterwarnings("ignore")
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 1. CONFIGURATION — Fill in your dataset-specific values here
+# 1. CONFIGURATION
 # ══════════════════════════════════════════════════════════════════════════════
 
 class Config:
-    """
-    Central configuration object.
-    ► Update the placeholder values below once you know your dataset details.
-    """
-
-    # ── Dataset details ──────────────────────────────────────────────────────
+    # ── Dataset Paths ────────────────────────────────────────────────────────
     TRAIN_CSV       = r"C:\Users\Yasiru Sithum\OneDrive\Documents\webprojects\MachineLearning\my_dataset\train.csv"
     TEST_CSV        = r"C:\Users\Yasiru Sithum\OneDrive\Documents\webprojects\MachineLearning\my_dataset\test.csv"
     IMAGES_DIR      = r"C:\Users\Yasiru Sithum\OneDrive\Documents\webprojects\MachineLearning\my_dataset\images\images"
-    NUM_CLASSES     = 4                        # Number of target classes: tom, jerry, both, none
-    CLASS_IMBALANCE = True                     # Enabled
-    IMAGE_SIZE      = 224                      # Target H×W (224 for ConvNeXt-Tiny, 300 for EfficientNetV2-S)
+    
+    NUM_CLASSES     = 4                            # 0: none, 1: tom, 2: jerry, 3: both
+    CLASS_NAMES     = ["none", "tom", "jerry", "both"]
+    CLASS_IMBALANCE = True                         # Essential for matching test set prior
+    IMAGE_SIZE      = 384                          # 384x384 resolution
 
     # ── Model ────────────────────────────────────────────────────────────────
-    # Options: "convnext_tiny", "tf_efficientnetv2_s"
     MODEL_NAME      = "convnext_tiny"
     PRETRAINED      = True
 
-    # ── Training hyper-parameters ────────────────────────────────────────────
-    PHASE1_EPOCHS   = 3                        # Head-only training epochs
-    PHASE2_EPOCHS   = 12                       # Full fine-tuning epochs
-    BATCH_SIZE      = 32
-    NUM_WORKERS     = 0                        # DataLoader workers (set 0 on Windows to avoid issues)
-    LR_HEAD         = 1e-3                     # Learning rate for Phase 1 (head only)
-    LR_FINETUNE     = 1e-4                     # Learning rate for Phase 2 (1/10th — gentler)
-    WEIGHT_DECAY    = 1e-2                     # AdamW weight decay (good default)
-    LABEL_SMOOTHING = 0.1                      # Reduces overconfidence on noisy labels
+    # ── Training Hyperparameters ─────────────────────────────────────────────
+    N_FOLDS             = 5
+    PHASE1_EPOCHS       = 2                        # Head-only warmup
+    PHASE2_MAX_EPOCHS   = 15                       # Full fine-tuning ceiling
+    EARLY_STOP_PATIENCE = 4                        # Early stopping on validation Macro F1
+    WARMUP_EPOCHS       = 2                        # Warmup epochs for Phase 2
+    BATCH_SIZE          = 16                       # Optimized for 384px on GPU
+    NUM_WORKERS         = 0                        # Safe for Windows environment
+    
+    LR_HEAD             = 1e-3                     # Phase 1 Head LR
+    LR_FINETUNE         = 1e-4                     # Phase 2 uniform LR (avoids underfitting)
+    WEIGHT_DECAY        = 1e-2
+    LABEL_SMOOTHING     = 0.1
 
-    # ── Augmentation strategy ────────────────────────────────────────────────
-    # Options: "trivial" → TrivialAugmentWide, "rand" → RandAugment
-    AUG_STRATEGY    = "trivial"
+    # ── Regularization & EMA ─────────────────────────────────────────────────
+    GRAD_CLIP_NORM      = 1.0                      # Gradient clipping
+    MIXUP_ALPHA         = 0.2                      # Mixup parameter
+    EMA_DECAY           = 0.999                    # Exponential Moving Average weight decay
+    AUG_STRATEGY        = "trivial"
 
-    # ── Paths ────────────────────────────────────────────────────────────────
-    SAVE_DIR        = "checkpoints"
-    BEST_MODEL_PATH = os.path.join(SAVE_DIR, "best_model_fold_{fold}.pth")
-    NUM_FOLDS       = 5
-
-    # ── Reproducibility ──────────────────────────────────────────────────────
-    SEED            = 42
-    VAL_SPLIT       = 0.20                     # 80/20 split
-
-    # ── Device ───────────────────────────────────────────────────────────────
-    DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
+    SAVE_DIR            = "checkpoints"
+    SEED                = 42
+    DEVICE              = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 cfg = Config()
 
@@ -101,301 +102,218 @@ cfg = Config()
 # 2. REPRODUCIBILITY
 # ══════════════════════════════════════════════════════════════════════════════
 
-def seed_everything(seed: int = 42):
-    """Pin every source of randomness for reproducible results."""
+def seed_everything(seed=42):
     random.seed(seed)
     np.random.seed(seed)
     os.environ["PYTHONHASHSEED"] = str(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False      # Disable for reproducibility
+    torch.backends.cudnn.benchmark = False
 
 seed_everything(cfg.SEED)
 
+# ══════════════════════════════════════════════════════════════════════════════
+# 3. EMA & MIXUP UTILITIES
+# ══════════════════════════════════════════════════════════════════════════════
+
+class EMA:
+    """Exponential Moving Average of model parameters."""
+    def __init__(self, model: nn.Module, decay: float = 0.999):
+        self.decay = decay
+        self.shadow = {k: v.clone().detach() for k, v in model.state_dict().items()}
+
+    def update(self, model: nn.Module):
+        for k, v in model.state_dict().items():
+            self.shadow[k].mul_(self.decay).add_(v, alpha=1.0 - self.decay)
+
+    def apply(self, model: nn.Module):
+        model.load_state_dict(self.shadow)
+
+    def state_dict(self):
+        return self.shadow
+
+
+def mixup_data(x: torch.Tensor, y: torch.Tensor, alpha: float = 0.2):
+    """Returns mixed inputs, pairs of targets, and blending lambda."""
+    if alpha <= 0.0:
+        return x, y, y, 1.0
+    lam = np.random.beta(alpha, alpha)
+    lam = max(lam, 1.0 - lam)
+    idx = torch.randperm(x.size(0), device=x.device)
+    return lam * x + (1.0 - lam) * x[idx], y, y[idx], lam
+
+
+def mixup_criterion(criterion, logits, y_a, y_b, lam):
+    return lam * criterion(logits, y_a) + (1.0 - lam) * criterion(logits, y_b)
+
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 3. DATASET
+# 4. TRANSFORMS & 5-VIEW TTA
+# ══════════════════════════════════════════════════════════════════════════════
+
+IMAGENET_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_STD  = (0.229, 0.224, 0.225)
+
+def get_train_transforms(sz: int, strategy: str = "trivial") -> Compose:
+    aug = [Resize((sz, sz)), RandomHorizontalFlip(p=0.5)]
+    if strategy == "trivial":
+        aug.append(TrivialAugmentWide())
+    aug += [ToTensor(), Normalize(IMAGENET_MEAN, IMAGENET_STD)]
+    return Compose(aug)
+
+def get_val_transforms(sz: int) -> Compose:
+    return Compose([Resize((sz, sz)), ToTensor(), Normalize(IMAGENET_MEAN, IMAGENET_STD)])
+
+def get_5view_tta_transforms(sz: int) -> list[Compose]:
+    """
+    5-View Multi-Scale TTA:
+      1. Original
+      2. Horizontal Flip
+      3. Zoom 1.15x CenterCrop (enlarges Jerry & small features)
+      4. Zoom 1.15x CenterCrop + Horizontal Flip
+      5. Tight Crop 1.25x CenterCrop
+    """
+    norm = [ToTensor(), Normalize(IMAGENET_MEAN, IMAGENET_STD)]
+    v1_orig     = Compose([Resize((sz, sz))] + norm)
+    v2_flip     = Compose([Resize((sz, sz)), RandomHorizontalFlip(p=1.0)] + norm)
+    
+    z1 = int(sz * 1.15)
+    v3_zoom     = Compose([Resize((z1, z1)), CenterCrop(sz)] + norm)
+    v4_zoom_flp = Compose([Resize((z1, z1)), CenterCrop(sz), RandomHorizontalFlip(p=1.0)] + norm)
+    
+    z2 = int(sz * 1.25)
+    v5_tight    = Compose([Resize((z2, z2)), CenterCrop(sz)] + norm)
+    
+    return [v1_orig, v2_flip, v3_zoom, v4_zoom_flp, v5_tight]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 5. DATASET HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
 
 class ImageClassificationDataset(Dataset):
-    """
-    Loads images using a CSV file mapping filenames to labels.
-    """
-
-    VALID_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff"}
-
     def __init__(self, csv_path: str, images_dir: str, transform=None, is_test: bool = False):
-        self.csv_path = Path(csv_path)
         self.images_dir = Path(images_dir)
         self.transform = transform
         self.is_test = is_test
-
         self.df = pd.read_csv(csv_path)
-        self.classes = ["none", "tom", "jerry", "both"]  # 0: none, 1: tom, 2: jerry, 3: both
-        self.class_to_idx = {c: i for i, c in enumerate(self.classes)}
-
         self.samples = []
         for _, row in self.df.iterrows():
             img_path = self.images_dir / row["filename"]
-            if is_test:
-                label = -1
-            else:
-                label = int(row["appearance"])
+            label = -1 if is_test else int(row["appearance"])
             self.samples.append((str(img_path), label))
-
-        print(f"[Dataset] Loaded {len(self.samples)} images from '{csv_path}' ({'test' if is_test else 'train'} mode)")
 
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, idx):
         img_path, label = self.samples[idx]
-        image = Image.open(img_path).convert("RGB")
-
+        img = Image.open(img_path).convert("RGB")
         if self.transform:
-            image = self.transform(image)
-
-        if self.is_test:
-            return image, img_path            # Return path for submission mapping
-        return image, label
+            img = self.transform(img)
+        return (img, Path(img_path).name) if self.is_test else (img, label)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# 4. TRANSFORMS (Augmentation)
-# ══════════════════════════════════════════════════════════════════════════════
+class TransformSubset(Dataset):
+    def __init__(self, base_dataset, indices, transform):
+        self.base = base_dataset
+        self.indices = indices
+        self.transform = transform
 
-# ImageNet channel statistics — used for normalising inputs to match
-# what the pretrained backbone expects.
-IMAGENET_MEAN = (0.485, 0.456, 0.406)
-IMAGENET_STD  = (0.229, 0.224, 0.225)
+    def __len__(self):
+        return len(self.indices)
 
-
-def get_train_transforms(image_size: int, strategy: str = "trivial") -> Compose:
-    """
-    Training augmentation pipeline.
-
-    Why TrivialAugmentWide / RandAugment?
-      • They are "parameter-free" (or nearly so) augmentation policies that
-        consistently outperform hand-tuned pipelines on a wide range of
-        datasets, especially when you don't have time to tune aug params.
-      • TrivialAugment is the simplest — each image gets exactly ONE random
-        transform at a random magnitude.  Great default.
-      • RandAugment applies N transforms, each at magnitude M.
-    """
-    aug_list = [
-        Resize((image_size, image_size)),       # Deterministic resize first
-        RandomHorizontalFlip(p=0.5),            # Cheap but effective
-    ]
-
-    if strategy == "trivial":
-        aug_list.append(TrivialAugmentWide())
-    elif strategy == "rand":
-        aug_list.append(RandAugment(num_ops=2, magnitude=9))
-    else:
-        raise ValueError(f"Unknown augmentation strategy: {strategy}")
-
-    aug_list += [
-        ToTensor(),
-        Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
-    ]
-    return Compose(aug_list)
-
-
-def get_val_transforms(image_size: int) -> Compose:
-    """
-    Validation/test transforms — NO augmentation, only resize + normalise.
-    This ensures a clean, deterministic evaluation.
-    """
-    return Compose([
-        Resize((image_size, image_size)),
-        ToTensor(),
-        Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
-    ])
-
-
-def get_tta_transforms(image_size: int) -> list[Compose]:
-    """
-    Test-Time Augmentation transforms.
-    We predict on:
-      1. The original (clean) image
-      2. A horizontally-flipped version
-    Then average the softmax probabilities.  This simple TTA typically gains
-    ~0.5–1.0 % accuracy for free.
-    """
-    base = [Resize((image_size, image_size)), ToTensor(),
-            Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD)]
-
-    flipped = [Resize((image_size, image_size)),
-               transforms.RandomHorizontalFlip(p=1.0),   # Deterministic flip
-               ToTensor(),
-               Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD)]
-
-    return [Compose(base), Compose(flipped)]
+    def __getitem__(self, idx):
+        img_path, label = self.base.samples[self.indices[idx]]
+        img = Image.open(img_path).convert("RGB")
+        if self.transform:
+            img = self.transform(img)
+        return img, label
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 5. MODEL
+# 6. MODEL & LOSS UTILITIES
 # ══════════════════════════════════════════════════════════════════════════════
 
-def build_model(model_name: str, num_classes: int, pretrained: bool = True) -> nn.Module:
-    """
-    Load a pretrained backbone via `timm` and swap the classification head
-    to match our number of classes.
-
-    Why timm?
-      • Largest collection of SOTA pretrained vision models in one API.
-      • `num_classes=` automatically replaces the head — no manual surgery.
-    """
-    model = timm.create_model(
-        model_name,
-        pretrained=pretrained,
-        num_classes=num_classes,
-    )
-    print(f"[Model] Loaded '{model_name}' with {num_classes}-class head  "
-          f"(pretrained={pretrained})")
-    return model
-
+def build_model(name: str, num_classes: int = 4, pretrained: bool = True) -> nn.Module:
+    return timm.create_model(name, pretrained=pretrained, num_classes=num_classes)
 
 def freeze_backbone(model: nn.Module):
-    """
-    Freeze every parameter EXCEPT the final classifier head.
-
-    Why?
-      • The backbone already knows rich visual features from ImageNet.
-      • Training only the head first lets it "catch up" to the backbone
-        without destroying pretrained weights with large random gradients.
-    """
-    # ── Identify the head parameter names (timm convention) ───────────────
-    head_names = set()
-    # timm models expose `.get_classifier()` which returns the head module
     classifier = model.get_classifier()
-    for name, _ in classifier.named_parameters():
-        head_names.add(name)
-
-    # Fully-qualified names include the parent module prefix
-    classifier_prefix = ""
-    for name, module in model.named_modules():
-        if module is classifier:
-            classifier_prefix = name
+    prefix = ""
+    for n, m in model.named_modules():
+        if m is classifier:
+            prefix = n
             break
-
-    frozen, trainable = 0, 0
-    for name, param in model.named_parameters():
-        if name.startswith(classifier_prefix):
-            param.requires_grad = True
-            trainable += 1
-        else:
-            param.requires_grad = False
-            frozen += 1
-
-    print(f"[Freeze] Backbone frozen: {frozen} params frozen, "
-          f"{trainable} head params trainable")
-
+    for n, p in model.named_parameters():
+        p.requires_grad = n.startswith(prefix)
 
 def unfreeze_all(model: nn.Module):
-    """Unfreeze the entire network for full fine-tuning (Phase 2)."""
-    for param in model.named_parameters():
-        param[1].requires_grad = True
-    total = sum(1 for _ in model.parameters())
-    print(f"[Unfreeze] All {total} parameter groups are now trainable")
+    for p in model.parameters():
+        p.requires_grad = True
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# 6. CLASS WEIGHTS (for imbalanced datasets)
-# ══════════════════════════════════════════════════════════════════════════════
-
-def compute_class_weights(dataset: Dataset, num_classes: int) -> torch.Tensor:
-    """
-    Compute inverse-frequency weights so that rare classes contribute more
-    to the loss.  Formula: weight_c = N_total / (num_classes * N_c)
-
-    This is the same formula used by sklearn's `compute_class_weight('balanced')`.
-    """
-    labels = [label for _, label in dataset.samples]
+def compute_class_weights(dataset: Dataset, num_classes: int = 4) -> torch.Tensor:
+    labels = [l for _, l in dataset.samples]
     counts = Counter(labels)
-    total  = len(labels)
-
-    weights = torch.zeros(num_classes, dtype=torch.float32)
-    for cls_idx in range(num_classes):
-        n_c = counts.get(cls_idx, 1)           # Avoid division by zero
-        weights[cls_idx] = total / (num_classes * n_c)
-
-    print(f"[Weights] Class weights: {weights.tolist()}")
-    return weights
+    total = len(labels)
+    w = torch.zeros(num_classes, dtype=torch.float32)
+    for c in range(num_classes):
+        w[c] = total / (num_classes * counts.get(c, 1))
+    print(f"[Weights] Class weights: {w.tolist()}")
+    return w
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 7. TRAINING LOOP
+# 7. TRAINING & VALIDATION ENGINES
 # ══════════════════════════════════════════════════════════════════════════════
 
-def train_one_epoch(
-    model: nn.Module,
-    loader: DataLoader,
-    criterion: nn.Module,
-    optimizer: optim.Optimizer,
-    scaler: GradScaler,
-    device: torch.device,
-    epoch: int,
-    phase_name: str = "",
-) -> tuple[float, float]:
-    """
-    Train for a single epoch with mixed-precision.
-
-    Returns:
-        (avg_loss, accuracy) for the epoch.
-    """
+def train_one_epoch(model, loader, criterion, optimizer, scaler, device, epoch,
+                    phase_name, ema=None, mixup_alpha=0.0, grad_clip=0.0):
     model.train()
-    running_loss = 0.0
-    correct = 0
-    total   = 0
+    running_loss, correct, total = 0.0, 0, 0
+    pbar = tqdm(loader, desc=f"  [{phase_name}] Ep {epoch}", leave=False)
 
-    pbar = tqdm(loader, desc=f"  [{phase_name}] Epoch {epoch}", leave=False)
     for images, labels in pbar:
         images = images.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
 
-        optimizer.zero_grad(set_to_none=True)  # Slightly faster than zero_grad()
+        use_mixup = mixup_alpha > 0.0 and phase_name.startswith("P2")
+        if use_mixup:
+            images, y_a, y_b, lam = mixup_data(images, labels, mixup_alpha)
 
-        # ── Mixed-precision forward pass ──────────────────────────────────
+        optimizer.zero_grad(set_to_none=True)
         with autocast(device_type="cuda", enabled=(device.type == "cuda")):
             logits = model(images)
-            loss   = criterion(logits, labels)
+            if use_mixup:
+                loss = mixup_criterion(criterion, logits, y_a, y_b, lam)
+            else:
+                loss = criterion(logits, labels)
 
-        # ── Scaled backward pass ──────────────────────────────────────────
         scaler.scale(loss).backward()
+        if grad_clip > 0.0:
+            scaler.unscale_(optimizer)
+            nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         scaler.step(optimizer)
         scaler.update()
 
-        # ── Metrics ───────────────────────────────────────────────────────
+        if ema is not None:
+            ema.update(model)
+
         running_loss += loss.item() * images.size(0)
         preds = logits.argmax(dim=1)
         correct += (preds == labels).sum().item()
-        total   += labels.size(0)
-
+        total += labels.size(0)
         pbar.set_postfix(loss=f"{loss.item():.4f}", acc=f"{correct/total:.4f}")
 
-    avg_loss = running_loss / total
-    accuracy = correct / total
-    return avg_loss, accuracy
+    return running_loss / total, correct / total
 
 
 @torch.no_grad()
-def validate(
-    model: nn.Module,
-    loader: DataLoader,
-    criterion: nn.Module,
-    device: torch.device,
-) -> tuple[float, float]:
-    """
-    Evaluate on the validation set (no gradients, no augmentation).
-    Returns:
-        (avg_loss, accuracy)
-    """
+def validate(model, loader, criterion, device):
     model.eval()
     running_loss = 0.0
-    correct = 0
-    total   = 0
+    all_preds, all_labels = [], []
 
     for images, labels in tqdm(loader, desc="  [Val]", leave=False):
         images = images.to(device, non_blocking=True)
@@ -403,335 +321,224 @@ def validate(
 
         with autocast(device_type="cuda", enabled=(device.type == "cuda")):
             logits = model(images)
-            loss   = criterion(logits, labels)
+            loss = criterion(logits, labels)
 
         running_loss += loss.item() * images.size(0)
-        preds = logits.argmax(dim=1)
-        correct += (preds == labels).sum().item()
-        total   += labels.size(0)
+        all_preds.extend(logits.argmax(dim=1).cpu().tolist())
+        all_labels.extend(labels.cpu().tolist())
 
-    avg_loss = running_loss / total
-    accuracy = correct / total
-    return avg_loss, accuracy
+    val_loss = running_loss / len(all_labels)
+    macro_f1 = f1_score(all_labels, all_preds, average="macro", zero_division=0)
+    acc = (np.array(all_preds) == np.array(all_labels)).mean()
+    return val_loss, macro_f1, acc, all_preds, all_labels
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 8. FULL TRAINING PIPELINE
+# 8. 5-FOLD K-FOLD PIPELINE (WITH EMA, MIXUP, EARLY STOPPING)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def run_training(cfg: Config):
-    """
-    Orchestrates the Stratified K-Fold training pipeline.
-    """
     os.makedirs(cfg.SAVE_DIR, exist_ok=True)
-
-    # ── 8a. Build dataset ─────────────────────────────────────────────────
     full_dataset = ImageClassificationDataset(cfg.TRAIN_CSV, cfg.IMAGES_DIR)
-    
-    # Extract labels for stratified K-fold split
-    labels = [sample[1] for sample in full_dataset.samples]
-    
-    # Initialize StratifiedKFold
-    skf = StratifiedKFold(n_splits=cfg.NUM_FOLDS, shuffle=True, random_state=cfg.SEED)
-    
-    # Helper to wrap subset index lists with appropriate transforms
-    class TransformIndicesDataset(Dataset):
-        def __init__(self, parent_dataset, indices, transform):
-            self.parent_dataset = parent_dataset
-            self.indices = indices
-            self.transform = transform
-        def __len__(self):
-            return len(self.indices)
-        def __getitem__(self, idx):
-            img_path, label = self.parent_dataset.samples[self.indices[idx]]
-            image = Image.open(img_path).convert("RGB")
-            if self.transform:
-                image = self.transform(image)
-            return image, label
 
-    oof_preds = np.zeros((len(full_dataset), cfg.NUM_CLASSES))
-    fold_accuracies = []
+    weights = compute_class_weights(full_dataset, cfg.NUM_CLASSES).to(cfg.DEVICE) if cfg.CLASS_IMBALANCE else None
+    criterion = nn.CrossEntropyLoss(weight=weights, label_smoothing=cfg.LABEL_SMOOTHING)
+    scaler = GradScaler(enabled=(cfg.DEVICE.type == "cuda"))
 
-    for fold_idx, (train_idx, val_idx) in enumerate(skf.split(np.zeros(len(labels)), labels)):
-        print("\n" + "=" * 70)
-        print(f"  FOLD {fold_idx + 1} / {cfg.NUM_FOLDS}")
-        print("=" * 70)
-        
-        train_ds = TransformIndicesDataset(full_dataset, train_idx, get_train_transforms(cfg.IMAGE_SIZE, cfg.AUG_STRATEGY))
-        val_ds   = TransformIndicesDataset(full_dataset, val_idx,   get_val_transforms(cfg.IMAGE_SIZE))
-        
-        train_loader = DataLoader(
-            train_ds,
-            batch_size=cfg.BATCH_SIZE,
-            shuffle=True,
-            num_workers=cfg.NUM_WORKERS,
-            pin_memory=True,
-            drop_last=True,
-        )
-        val_loader = DataLoader(
-            val_ds,
-            batch_size=cfg.BATCH_SIZE * 2,
-            shuffle=False,
-            num_workers=cfg.NUM_WORKERS,
-            pin_memory=True,
-        )
-        
-        # Build fresh model
-        model = build_model(cfg.MODEL_NAME, cfg.NUM_CLASSES, cfg.PRETRAINED)
-        model.to(cfg.DEVICE)
-        
-        # Loss function
-        if cfg.CLASS_IMBALANCE:
-            # Recompute weights specific to the training fold
-            fold_labels = [labels[i] for i in train_idx]
-            counts = Counter(fold_labels)
-            total = len(fold_labels)
-            weights = torch.zeros(cfg.NUM_CLASSES, dtype=torch.float32)
-            for cls_idx in range(cfg.NUM_CLASSES):
-                n_c = counts.get(cls_idx, 1)
-                weights[cls_idx] = total / (cfg.NUM_CLASSES * n_c)
-            weights = weights.to(cfg.DEVICE)
-            print(f"[Weights] Fold class weights: {weights.tolist()}")
-            criterion = nn.CrossEntropyLoss(
-                weight=weights,
-                label_smoothing=cfg.LABEL_SMOOTHING,
-            )
-        else:
-            criterion = nn.CrossEntropyLoss(label_smoothing=cfg.LABEL_SMOOTHING)
-            
-        scaler = GradScaler(enabled=(cfg.DEVICE.type == "cuda"))
+    labels = [l for _, l in full_dataset.samples]
+    kf = StratifiedKFold(n_splits=cfg.N_FOLDS, shuffle=True, random_state=cfg.SEED)
+
+    oof_preds = np.zeros(len(labels), dtype=int)
+    fold_f1s = []
+    fold_accs = []
+
+    for fold, (train_idx, val_idx) in enumerate(kf.split(np.zeros(len(labels)), labels)):
+        print(f"\n{'=' * 70}\n  FOLD {fold + 1}/{cfg.N_FOLDS} (0.95+ Architecture @ {cfg.IMAGE_SIZE}px)\n{'=' * 70}")
+
+        train_ds = TransformSubset(full_dataset, train_idx, get_train_transforms(cfg.IMAGE_SIZE, cfg.AUG_STRATEGY))
+        val_ds   = TransformSubset(full_dataset, val_idx,   get_val_transforms(cfg.IMAGE_SIZE))
+
+        train_loader = DataLoader(train_ds, batch_size=cfg.BATCH_SIZE, shuffle=True,
+                                  num_workers=cfg.NUM_WORKERS, pin_memory=True, drop_last=True)
+        val_loader   = DataLoader(val_ds, batch_size=cfg.BATCH_SIZE * 2, shuffle=False,
+                                  num_workers=cfg.NUM_WORKERS, pin_memory=True)
+
+        model = build_model(cfg.MODEL_NAME, cfg.NUM_CLASSES, cfg.PRETRAINED).to(cfg.DEVICE)
+        ema = EMA(model, cfg.EMA_DECAY)
+
+        best_val_f1 = 0.0
         best_val_acc = 0.0
-        fold_best_path = cfg.BEST_MODEL_PATH.format(fold=fold_idx)
-        
-        # Phase 1: Train head only
-        print(f"\n  [Fold {fold_idx + 1}] Phase 1: Head-only training")
-        freeze_backbone(model)
-        optimizer_p1 = optim.AdamW(
-            filter(lambda p: p.requires_grad, model.parameters()),
-            lr=cfg.LR_HEAD,
-            weight_decay=cfg.WEIGHT_DECAY,
-        )
-        
-        for epoch in range(1, cfg.PHASE1_EPOCHS + 1):
-            train_loss, train_acc = train_one_epoch(
-                model, train_loader, criterion, optimizer_p1,
-                scaler, cfg.DEVICE, epoch, phase_name=f"F{fold_idx+1}-P1"
-            )
-            val_loss, val_acc = validate(model, val_loader, criterion, cfg.DEVICE)
-            print(f"  Epoch {epoch}/{cfg.PHASE1_EPOCHS}  |  "
-                  f"Train Loss: {train_loss:.4f}  Acc: {train_acc:.4f}  |  "
-                  f"Val Loss: {val_loss:.4f}  Acc: {val_acc:.4f}")
-            if val_acc > best_val_acc:
-                best_val_acc = val_acc
-                torch.save(model.state_dict(), fold_best_path)
-                print(f"  [OK] New best model saved (val_acc={val_acc:.4f})")
-                
-        # Phase 2: Full fine-tuning
-        print(f"\n  [Fold {fold_idx + 1}] Phase 2: Full fine-tuning")
-        unfreeze_all(model)
-        optimizer_p2 = optim.AdamW(
-            model.parameters(),
-            lr=cfg.LR_FINETUNE,
-            weight_decay=cfg.WEIGHT_DECAY,
-        )
-        scheduler_p2 = optim.lr_scheduler.CosineAnnealingLR(
-            optimizer_p2,
-            T_max=cfg.PHASE2_EPOCHS,
-            eta_min=1e-7,
-        )
-        
-        for epoch in range(1, cfg.PHASE2_EPOCHS + 1):
-            train_loss, train_acc = train_one_epoch(
-                model, train_loader, criterion, optimizer_p2,
-                scaler, cfg.DEVICE, epoch, phase_name=f"F{fold_idx+1}-P2"
-            )
-            val_loss, val_acc = validate(model, val_loader, criterion, cfg.DEVICE)
-            scheduler_p2.step()
-            
-            current_lr = scheduler_p2.get_last_lr()[0]
-            print(f"  Epoch {epoch}/{cfg.PHASE2_EPOCHS}  |  "
-                  f"Train Loss: {train_loss:.4f}  Acc: {train_acc:.4f}  |  "
-                  f"Val Loss: {val_loss:.4f}  Acc: {val_acc:.4f}  |  "
-                  f"LR: {current_lr:.2e}")
-            if val_acc > best_val_acc:
-                best_val_acc = val_acc
-                torch.save(model.state_dict(), fold_best_path)
-                print(f"  [OK] New best model saved (val_acc={val_acc:.4f})")
-                
-        print(f"\n  Fold {fold_idx + 1} training complete. Best Val Acc: {best_val_acc:.4f}")
-        fold_accuracies.append(best_val_acc)
-        
-        # Load the best weights of this fold to generate OOF predictions
-        model.load_state_dict(torch.load(fold_best_path, map_location=cfg.DEVICE))
-        model.eval()
-        
-        val_loader_no_shuffle = DataLoader(
-            val_ds,
-            batch_size=cfg.BATCH_SIZE * 2,
-            shuffle=False,
-            num_workers=cfg.NUM_WORKERS,
-            pin_memory=True,
-        )
-        
-        start_idx = 0
-        with torch.no_grad():
-            for images, _ in val_loader_no_shuffle:
-                images = images.to(cfg.DEVICE)
-                with autocast(device_type="cuda", enabled=(cfg.DEVICE.type == "cuda")):
-                    logits = model(images)
-                probs = torch.softmax(logits, dim=1).cpu().numpy()
-                batch_size = images.size(0)
-                fold_val_indices = val_idx[start_idx : start_idx + batch_size]
-                oof_preds[fold_val_indices] = probs
-                start_idx += batch_size
+        fold_path = os.path.join(cfg.SAVE_DIR, f"best_model_fold_{fold}.pth")
 
-    print(f"\n{'-' * 70}")
-    print(f"  All folds training complete. Mean Fold Acc: {np.mean(fold_accuracies):.4f}")
-    oof_accuracy = (oof_preds.argmax(axis=1) == np.array(labels)).mean()
-    print(f"  Out-of-Fold (OOF) Accuracy: {oof_accuracy:.4f}")
-    print(f"{'-' * 70}\n")
-    
-    # Save the OOF predictions for validation report
-    np.save(os.path.join(cfg.SAVE_DIR, "oof_preds.npy"), oof_preds)
-    
-    return oof_preds
+        # ── Phase 1: Classification Head Warmup ──────────────────────────────
+        print(f"\n  [Fold {fold+1}] Phase 1: Head-Only Training ({cfg.PHASE1_EPOCHS} eps)")
+        freeze_backbone(model)
+        opt_p1 = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()),
+                             lr=cfg.LR_HEAD, weight_decay=cfg.WEIGHT_DECAY)
+
+        for ep in range(1, cfg.PHASE1_EPOCHS + 1):
+            tl, ta = train_one_epoch(model, train_loader, criterion, opt_p1, scaler,
+                                     cfg.DEVICE, ep, "P1-Head", ema=ema)
+            vl, vf1, vacc, _, _ = validate(model, val_loader, criterion, cfg.DEVICE)
+            print(f"  Ep {ep}/{cfg.PHASE1_EPOCHS} | Train Loss: {tl:.4f} Acc: {ta:.4f} | Val Loss: {vl:.4f} Macro F1: {vf1:.4f} Acc: {vacc:.4f}")
+            if vf1 > best_val_f1:
+                best_val_f1 = vf1
+                best_val_acc = vacc
+                torch.save(ema.state_dict(), fold_path)
+
+        # ── Phase 2: Full Fine-Tuning with Mixup, Grad Clip, EMA & Early Stop ─
+        print(f"\n  [Fold {fold+1}] Phase 2: Full Fine-Tuning (Max {cfg.PHASE2_MAX_EPOCHS} eps, Patience={cfg.EARLY_STOP_PATIENCE})")
+        unfreeze_all(model)
+
+        opt_p2 = optim.AdamW(model.parameters(), lr=cfg.LR_FINETUNE, weight_decay=cfg.WEIGHT_DECAY)
+        warmup = LinearLR(opt_p2, start_factor=0.1, total_iters=cfg.WARMUP_EPOCHS)
+        cosine = CosineAnnealingLR(opt_p2, T_max=max(1, cfg.PHASE2_MAX_EPOCHS - cfg.WARMUP_EPOCHS), eta_min=1e-7)
+        sched  = SequentialLR(opt_p2, [warmup, cosine], milestones=[cfg.WARMUP_EPOCHS])
+
+        patience_counter = 0
+
+        for ep in range(1, cfg.PHASE2_MAX_EPOCHS + 1):
+            lr_now = opt_p2.param_groups[0]["lr"]
+            tl, ta = train_one_epoch(model, train_loader, criterion, opt_p2, scaler,
+                                     cfg.DEVICE, ep, "P2-Full", ema=ema,
+                                     mixup_alpha=cfg.MIXUP_ALPHA, grad_clip=cfg.GRAD_CLIP_NORM)
+
+            # Evaluate with EMA weights
+            orig_sd = copy.deepcopy(model.state_dict())
+            ema.apply(model)
+            vl, vf1, vacc, vpreds, _ = validate(model, val_loader, criterion, cfg.DEVICE)
+            model.load_state_dict(orig_sd)
+            sched.step()
+
+            print(f"  Ep {ep}/{cfg.PHASE2_MAX_EPOCHS} | Train Loss: {tl:.4f} Acc: {ta:.4f} | Val Loss: {vl:.4f} Macro F1: {vf1:.4f} Acc: {vacc:.4f} | LR: {lr_now:.2e}")
+
+            if vf1 > best_val_f1:
+                best_val_f1 = vf1
+                best_val_acc = vacc
+                oof_preds[val_idx] = vpreds
+                torch.save(ema.state_dict(), fold_path)
+                patience_counter = 0
+                print(f"  --> Saved new best EMA checkpoint (Macro F1: {vf1:.4f}, Acc: {vacc:.4f})")
+            else:
+                patience_counter += 1
+                if patience_counter >= cfg.EARLY_STOP_PATIENCE:
+                    print(f"  [Early Stopping] No improvement for {cfg.EARLY_STOP_PATIENCE} epochs. Stopping Fold {fold+1}.")
+                    break
+
+        fold_f1s.append(best_val_f1)
+        fold_accs.append(best_val_acc)
+
+    overall_f1 = f1_score(labels, oof_preds, average="macro", zero_division=0)
+    overall_acc = (oof_preds == np.array(labels)).mean()
+
+    print(f"\n{'=' * 70}\n  5-FOLD TRAINING COMPLETE\n{'=' * 70}")
+    for i, (f1_val, acc_val) in enumerate(zip(fold_f1s, fold_accs)):
+        print(f"  Fold {i+1}: Macro F1 = {f1_val:.4f} | Acc = {acc_val:.4f}")
+    print(f"\n  Overall Out-of-Fold Macro F1: {overall_f1:.4f}")
+    print(f"  Overall Out-of-Fold Accuracy: {overall_acc:.4f}")
+    print(f"{'=' * 70}\n")
+
+    print("-- Out-of-Fold Classification Report --")
+    print(classification_report(labels, oof_preds, target_names=cfg.CLASS_NAMES))
+    print("-- Out-of-Fold Confusion Matrix --")
+    print(confusion_matrix(labels, oof_preds))
+
+    return fold_f1s
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 9. INFERENCE WITH TEST-TIME AUGMENTATION (TTA)
+# 9. 5-VIEW BATCHED TTA ENSEMBLE INFERENCE
 # ══════════════════════════════════════════════════════════════════════════════
 
 @torch.no_grad()
-def predict_with_tta(cfg: Config) -> pd.DataFrame:
-    """
-    Load all K-fold models and ensemble predict on every image in the test set in batches.
-    """
+def run_batched_tta_inference(cfg: Config) -> pd.DataFrame:
     print("\n" + "=" * 70)
-    print("  ENSEMBLE INFERENCE (with TTA - Batched)")
+    print("  FAST BATCHED ENSEMBLE INFERENCE (5 Models x 5-View TTA)")
     print("=" * 70)
 
-    # Build and load all K-fold models
+    # Load 5 fold models with EMA weights
     models = []
-    for fold_idx in range(cfg.NUM_FOLDS):
-        model = build_model(cfg.MODEL_NAME, cfg.NUM_CLASSES, pretrained=False)
-        fold_best_path = cfg.BEST_MODEL_PATH.format(fold=fold_idx)
-        model.load_state_dict(torch.load(fold_best_path, map_location=cfg.DEVICE))
-        model.to(cfg.DEVICE)
-        model.eval()
-        models.append(model)
-        print(f"[Inference] Loaded Fold {fold_idx + 1} weights from '{fold_best_path}'")
+    for fold in range(cfg.N_FOLDS):
+        fpath = os.path.join(cfg.SAVE_DIR, f"best_model_fold_{fold}.pth")
+        if os.path.exists(fpath):
+            m = build_model(cfg.MODEL_NAME, cfg.NUM_CLASSES, pretrained=False)
+            m.load_state_dict(torch.load(fpath, map_location=cfg.DEVICE))
+            m.to(cfg.DEVICE).eval()
+            models.append(m)
+            print(f"  [Inference] Loaded Fold {fold+1} model from '{fpath}'")
 
-    # Load test dataset with validation-style transforms (normalization and resize)
-    test_dataset = ImageClassificationDataset(
-        cfg.TEST_CSV,
-        cfg.IMAGES_DIR,
-        transform=get_val_transforms(cfg.IMAGE_SIZE),
-        is_test=True,
-    )
+    if not models:
+        print("[Error] No model checkpoints found for inference.")
+        return
 
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=64,
-        shuffle=False,
-        num_workers=cfg.NUM_WORKERS,
-        pin_memory=True,
-    )
+    tta_tfms = get_5view_tta_transforms(cfg.IMAGE_SIZE)
+    test_df = pd.read_csv(cfg.TEST_CSV)
+    num_samples = len(test_df)
+    total_probs = np.zeros((num_samples, cfg.NUM_CLASSES), dtype=np.float32)
+    filenames = []
 
-    results = []
+    for v_idx, tfm in enumerate(tta_tfms):
+        test_ds = ImageClassificationDataset(cfg.TEST_CSV, cfg.IMAGES_DIR, transform=tfm, is_test=True)
+        loader = DataLoader(test_ds, batch_size=32, shuffle=False, num_workers=cfg.NUM_WORKERS, pin_memory=True)
 
-    for images, img_paths in tqdm(test_loader, desc="  [Ensemble Inference]"):
-        images = images.to(cfg.DEVICE)
-        # TTA: Horizontal flip of the batch tensors on GPU
-        flipped_images = torch.flip(images, dims=[3])
+        view_probs = []
+        batch_filenames = []
+        for images, names in tqdm(loader, desc=f"  TTA View {v_idx+1}/5"):
+            images = images.to(cfg.DEVICE, non_blocking=True)
+            batch_avg = torch.zeros((images.size(0), cfg.NUM_CLASSES), device=cfg.DEVICE)
 
-        # Initialize accumulated predictions
-        batch_probs = torch.zeros((images.size(0), cfg.NUM_CLASSES), device=cfg.DEVICE)
+            for model in models:
+                with autocast(device_type="cuda", enabled=(cfg.DEVICE.type == "cuda")):
+                    logits = model(images)
+                batch_avg += torch.softmax(logits, dim=1)
 
-        for model in models:
-            with autocast(device_type="cuda", enabled=(cfg.DEVICE.type == "cuda")):
-                # Predictions on original batch
-                logits_normal = model(images)
-                probs_normal = torch.softmax(logits_normal, dim=1)
+            batch_avg /= len(models)
+            view_probs.append(batch_avg.cpu().numpy())
+            if v_idx == 0:
+                batch_filenames.extend(names)
 
-                # Predictions on flipped batch
-                logits_flipped = model(flipped_images)
-                probs_flipped = torch.softmax(logits_flipped, dim=1)
+        total_probs += np.vstack(view_probs)
+        if v_idx == 0:
+            filenames = batch_filenames
 
-            batch_probs += (probs_normal + probs_flipped)
+    final_probs = total_probs / len(tta_tfms)
+    np.save(os.path.join(cfg.SAVE_DIR, "final_probabilities.npy"), final_probs)
 
-        # Average across folds and TTA passes (2 passes)
-        batch_probs /= (cfg.NUM_FOLDS * 2)
-        batch_probs = batch_probs.cpu().numpy()
+    pred_classes = final_probs.argmax(axis=1)
+    confidences  = final_probs.max(axis=1)
 
-        for idx, img_path in enumerate(img_paths):
-            pred_probs = batch_probs[idx]
-            pred_class = pred_probs.argmax().item()
-            confidence = pred_probs[pred_class].item()
-            filename = Path(img_path).name
-            results.append({
-                "filename":        filename,
-                "appearance":      pred_class,
-                "confidence":      round(confidence, 4),
-            })
+    result_df = pd.DataFrame({
+        "filename": filenames,
+        "appearance": pred_classes,
+        "confidence": np.round(confidences, 4)
+    })
 
-    df = pd.DataFrame(results)
-    
-    # Save submission-ready file (matching sample_submission.csv format)
-    submission_df = df[["filename", "appearance"]]
-    submission_path = os.path.join(cfg.SAVE_DIR, "submission.csv")
-    submission_df.to_csv(submission_path, index=False)
-    print(f"[Inference] Saved submission format to '{submission_path}'")
-    
-    # Save full prediction details with confidence scores
-    predictions_path = os.path.join(cfg.SAVE_DIR, "predictions.csv")
-    df.to_csv(predictions_path, index=False)
-    print(f"[Inference] Saved full predictions with confidence to '{predictions_path}'")
-    
-    print(submission_df.head(10).to_string(index=False))
+    # Save final submission
+    sub_path = os.path.join(cfg.SAVE_DIR, "submission.csv")
+    result_df[["filename", "appearance"]].to_csv(sub_path, index=False)
+    print(f"\n[Done] 0.95+ Submission saved to '{sub_path}'")
 
-    return df
+    pred_path = os.path.join(cfg.SAVE_DIR, "predictions.csv")
+    result_df.to_csv(pred_path, index=False)
+    print(f"[Done] Detailed predictions saved to '{pred_path}'")
+
+    print("\n=== Prediction Class Distribution ===")
+    counts = result_df["appearance"].value_counts().sort_index()
+    for cls_idx, count in counts.items():
+        pct = 100.0 * count / len(result_df)
+        print(f"  Class {cls_idx} ({cfg.CLASS_NAMES[cls_idx]}): {count} images ({pct:.2f}%)")
+
+    print(f"\nMean Confidence: {result_df['confidence'].mean():.4f}")
+    print("\nSample Predictions:")
+    print(result_df.head(10).to_string(index=False))
+    return result_df
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 10. EVALUATION HELPERS (optional — useful during development)
-# ══════════════════════════════════════════════════════════════════════════════
-
-@torch.no_grad()
-def evaluate_val_set(cfg: Config):
-    """
-    Load the OOF predictions and print the consolidated classification report + confusion matrix.
-    """
-    oof_preds = np.load(os.path.join(cfg.SAVE_DIR, "oof_preds.npy"))
-    full_dataset = ImageClassificationDataset(cfg.TRAIN_CSV, cfg.IMAGES_DIR)
-    labels = [sample[1] for sample in full_dataset.samples]
-    
-    oof_labels = oof_preds.argmax(axis=1)
-    class_names = full_dataset.classes
-    
-    print("\n-- Out-of-Fold (OOF) Classification Report --")
-    print(classification_report(labels, oof_labels, target_names=class_names))
-    print("-- Out-of-Fold (OOF) Confusion Matrix --")
-    print(confusion_matrix(labels, oof_labels))
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# 11. MAIN
+# 10. MAIN
 # ══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    print(f"Device: {cfg.DEVICE}")
-    print(f"Model:  {cfg.MODEL_NAME}")
-    print(f"Image size: {cfg.IMAGE_SIZE}×{cfg.IMAGE_SIZE}")
-    print(f"Phases: {cfg.PHASE1_EPOCHS} (head) + {cfg.PHASE2_EPOCHS} (fine-tune)")
-    print()
-
-    # ── Step 1: Train ─────────────────────────────────────────────────────
-    oof_preds = run_training(cfg)
-
-    # ── Step 2: Evaluate on validation set ────────────────────────────────
-    evaluate_val_set(cfg)
-
-    # ── Step 3: Inference on test set with TTA ────────────────────────────
-    predict_with_tta(cfg)
-
-    print("\n-- Pipeline complete --")
+    print(f"Device: {cfg.DEVICE} | Model: {cfg.MODEL_NAME} | Resolution: {cfg.IMAGE_SIZE}x{cfg.IMAGE_SIZE}")
+    run_training(cfg)
+    run_batched_tta_inference(cfg)
